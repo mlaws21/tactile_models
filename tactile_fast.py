@@ -1,5 +1,7 @@
 import cv2
 from tqdm import tqdm
+import numpy as np
+from collections import Counter
 # NUM_PIXELS = 150
 
 class point:
@@ -30,16 +32,116 @@ class point:
 
 class lithograph:
     def __init__(self, image):
-        self.image = self.readImage(image)
+        img = cv2.imread(image)
+
+        img, palette = self.smooth_colors(img)
+        self.save_palette(palette)
+        self.image = self.readImage(img)
         self.stl = "solid\n"
         self.facets = []
         # need to add endsolid
     
-    def readImage(self, filename):
-        img = cv2.imread(filename)
+    # forces all pixels to color it is closest to
+    def smooth_colors(self, img, n_colors=2, min_dist=150):
+        """
+        Load an image, find its n most frequent colors, and build a palette
+        of n colors such that each is at least `min_dist` away from each other.
+        Then snap every pixel to the nearest palette color.
+
+        Parameters
+        ----------
+        img_path : str
+            Path to an RGB image file.
+        n_colors : int
+            Desired number of colors in the palette.
+        min_dist : float
+            Minimum Euclidean distance between any two palette colors.
+
+        Returns
+        -------
+        quantized : np.ndarray
+            Quantized image array of shape (H, W, 3), dtype uint8.
+        palette : np.ndarray
+            Array of shape (n_colors, 3) of the chosen RGB colors.
+        """
+
+        # 1) load and convert to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # 2) count frequencies
+        pixels = img.reshape(-1, 3)
+        counts = Counter(map(tuple, pixels))
+
+        # 3) iterate over the most common colors and pick only those far enough apart
+        palette = []
+        for color, _ in counts.most_common():
+            c = np.array(color, dtype=int)
+            if not palette:
+                palette.append(c)
+            else:
+                # compute distance to existing palette
+                dists = np.linalg.norm(np.stack(palette) - c, axis=1)
+                if np.all(dists >= min_dist):
+                    palette.append(c)
+            if len(palette) >= n_colors:
+                break
+
+        # If we didn't get enough, pad with next most common ignoring distance
+        if len(palette) < n_colors:
+            for color, _ in counts.most_common():
+                c = np.array(color, dtype=int)
+                if not any((c == p).all() for p in palette):
+                    palette.append(c)
+                if len(palette) >= n_colors:
+                    break
+
+        palette = np.stack(palette).astype(np.uint8)  # shape (n_colors,3)
+
+        # 4) assign each pixel to nearest palette color
+        flat = pixels.astype(int)
+        diffs = flat[:, None, :] - palette[None, :, :].astype(int)  # shape (num_pixels, n_colors, 3)
+        dists = np.linalg.norm(diffs, axis=2)                      # shape (num_pixels, n_colors)
+        idx = np.argmin(dists, axis=1)                            # shape (num_pixels,)
+
+        quantized = palette[idx].reshape(img.shape)
+
+        return quantized, palette
+
+
+    def save_palette(self, palette, filename="palette.png", block_size=50):
+        """
+        Save a color palette as an image.
+
+        Parameters
+        ----------
+        palette : array-like of shape (n_colors, 3)
+            RGB values (0–255) of each palette color.
+        filename : str
+            Path to write the palette image (e.g. 'palette.png').
+        block_size : int, optional
+            Width and height in pixels of each color block.
+        """
+        palette = np.asarray(palette, dtype=np.uint8)
+        n_colors = palette.shape[0]
+        # Create an image of height=block_size, width=n_colors*block_size
+        palette_img = np.zeros((block_size, block_size * n_colors, 3), dtype=np.uint8)
+
+        for i, color in enumerate(palette):
+            start = i * block_size
+            end   = start + block_size
+            # fill the block with this RGB color
+            palette_img[:, start:end, :] = color
+
+        # OpenCV expects BGR ordering
+        bgr = cv2.cvtColor(palette_img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(filename, bgr)
+
+    
+    def readImage(self, img):
         greyImg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         greyImg = cv2.resize(greyImg, (0, 0), fx=1, fy=1)
-        greyImg = cv2.GaussianBlur(greyImg, (9,9), 2.0)
+        # greyImg = cv2.GaussianBlur(greyImg, (1,1), 2.0)
+        greyImg = cv2.flip(greyImg, 1)
         
         image = 255 - greyImg
         cv2.imwrite("mod.png", image)
@@ -115,60 +217,53 @@ class lithograph:
         self.addRect(p000, p100, p010, p110, invert=True)  # z=0 side
         self.addRect(p001, p011, p101, p111)           # z=depth side
     
-    def magic(self, scale=1, levels=30):
-        img = self.image
-        n_rows = len(img)
-        n_cols = len(img[0])
+    def magic(self, scale=1, levels=30, plate_height=3):
+        img     = self.image
+        n_rows  = len(img)
+        n_cols  = len(img[0])
+        top     = max(max(row) for row in img)
 
-        # 1) find maximum once
-        top = max(max(row) for row in img)
-
-        # 2) draw one big base-plane at height 0.5
-        bl = point(0, 0, 0)
-        full_x = n_rows * scale
-        full_z = n_cols * scale
-        self.addRect(
-            bl,
-            bl + point(0, 0, full_z),
-            bl + point(full_x, 0, 0),
-            bl + point(full_x, 0, full_z)
+        # 1) Draw the uniform plate underneath:
+        self.addCuboid(
+            bottomLeft = point(0, 0, 0),
+            width      = n_rows * scale,
+            depth      = n_cols * scale,
+            height     = plate_height
         )
 
-        # 3) precompute height for each distinct pixel value
-        height_cache = {0: 0.5}
-        for val in set(v for row in img for v in row) - {0}:
-            layer = (val * levels) // top
-            h = layer * (top // levels) / 85 + 0.5
-            height_cache[val] = h
+        # 2) Precompute the “above‐plate” heights for each distinct pixel value
+        unit = (top // levels) / 85.0
+        height_above = {}
+        for v in {v for row in img for v in row}:
+            layer = (v * levels) // top if v > 0 else 0
+            height_above[v] = layer * unit
 
-        # 4) for each row, run‐length‐encode contiguous equal‐height runs
+        # 3) For each row, run‐length encode contiguous same‐height runs
         for i in tqdm(range(n_rows)):
-            # build list of heights for this row
-            row_heights = [height_cache[v] for v in img[i]]
+            row_vals   = img[i]
+            row_heights = [height_above[v] for v in row_vals]
 
             j = 0
             while j < n_cols:
                 h = row_heights[j]
-                if h == 0.5:
-                    # skip the base
+                # skip flat regions (just plate)
+                if h == 0:
                     j += 1
                     continue
 
-                # extend run while same height
                 start = j
                 while j < n_cols and row_heights[j] == h:
                     j += 1
                 length = j - start
 
-                # draw one cuboid spanning `length` pixels in z
-                bottom = point(i * scale, 0, start * scale)
+                # draw one cuboid sitting on top of the plate
+                bottom = point(i * scale, plate_height, start * scale)
                 self.addCuboid(
-                    bottom,
-                    width = scale,           # one pixel in x
-                    depth = length * scale,  # run length in z
-                    height = h
+                    bottomLeft = bottom,
+                    width      = scale,
+                    depth      = length * scale,
+                    height     = h
                 )
-
     
     def saveStl(self, filename):
         f = open(f'{filename}.stl', "w")
@@ -186,11 +281,14 @@ class lithograph:
 
 
 def main():
-    myLitho = lithograph("calder_test.jpeg")
+    # myLitho = lithograph("calder_test.jpeg")
+    myLitho = lithograph("poster.png")
+    
+    
     # myLitho.addRect(point(0, 0, 0), point(0, 0, 1),  point(1, 0, 0), point(1, 0, 1))
     # myLitho.add3Dpixel(point(0), 7)
     myLitho.magic(1, 10)
-    myLitho.saveStlFromArray("calder")
+    myLitho.saveStlFromArray("poster")
     # myLitho.readImage("jim.png")
     
     
