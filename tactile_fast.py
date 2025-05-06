@@ -42,7 +42,7 @@ class lithograph:
         # need to add endsolid
     
     # forces all pixels to color it is closest to
-    def smooth_colors(self, img, n_colors=2, min_dist=150):
+    def smooth_colors(self, img, n_colors=9, min_dist=50):
         """
         Load an image, find its n most frequent colors, and build a palette
         of n colors such that each is at least `min_dist` away from each other.
@@ -137,13 +137,14 @@ class lithograph:
         cv2.imwrite(filename, bgr)
 
     
-    def readImage(self, img):
+    def readImage(self, img, dark_high=False):
         greyImg = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         greyImg = cv2.resize(greyImg, (0, 0), fx=1, fy=1)
-        # greyImg = cv2.GaussianBlur(greyImg, (1,1), 2.0)
+        greyImg = cv2.GaussianBlur(greyImg, (5,5), 2.0)
         greyImg = cv2.flip(greyImg, 1)
         
-        image = 255 - greyImg
+        if dark_high:
+            image = 255 - greyImg
         cv2.imwrite("mod.png", image)
 
         return image
@@ -282,13 +283,13 @@ class lithograph:
 
 def main():
     # myLitho = lithograph("calder_test.jpeg")
-    myLitho = lithograph("poster.png")
+    myLitho = lithograph("poster2.tif")
     
     
     # myLitho.addRect(point(0, 0, 0), point(0, 0, 1),  point(1, 0, 0), point(1, 0, 1))
     # myLitho.add3Dpixel(point(0), 7)
     myLitho.magic(1, 10)
-    myLitho.saveStlFromArray("poster")
+    myLitho.saveStlFromArray("poster2")
     # myLitho.readImage("jim.png")
     
     
